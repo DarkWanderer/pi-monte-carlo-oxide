@@ -26,8 +26,11 @@ The estimate stays random and unbiased, integer-only, and bit-exact between GPU 
     lattice; `RunConfig`: a grid within 2^18..=2^50 samples, split into launch `Chunk`s; `Budget`:
     the CLI argument.
   - `thread_stats`: per-thread hits and *disagreements* (pairs whose two samples differ).
-- `src/main.rs`: the `count_hits` kernel (per-thread sampling, warp shuffle reduce, shared memory,
-  `sync_threads`, two `u32` counts per block) and the host orchestration.
+- `src/main.rs`: the `count_hits` kernel and the host orchestration. The kernel samples per thread,
+  reduces each warp with shuffles, and lane 0 of every warp adds the two counts into the block's
+  `DeviceAtomicU32` slots (relaxed, no shared memory or barrier). The kernel has no `unsafe`; the
+  only `unsafe` in the program is `kernels::load`. Blocks add into their slots, so the host zeroes
+  the counters before every launch.
 
 **Error estimate.** The expected number of disagreeing pairs D equals the variance of the hit count
 exactly, so the standard error is measured as σ̂ = 4·√D / N: integer-only, no analytic formula.
@@ -67,7 +70,8 @@ cargo test
 ```
 
 The unit tests are host-only. `cargo oxide test` also works but only with `-- --release`: a debug
-build trips a device-codegen verification error in cuda-oxide's `DisjointSlice::get_unchecked_mut`.
+build is rejected by device codegen with "atomic ordering must be a compile-time constant" for the
+`fetch_add` calls in `count_hits`.
 
 ## Sample output
 

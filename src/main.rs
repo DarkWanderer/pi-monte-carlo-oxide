@@ -8,9 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 use cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{
-    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
-};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+use cuda_device::{kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
 use tracing::{error, info, warn};
 
@@ -45,9 +44,10 @@ mod kernels {
     use super::*;
     use crate::mc::{Grid, thread_stats};
 
-    /// Each block writes the in-circle count and the disagreeing-pair count of
-    /// its threads. `block_offset` is the launch's first block in the whole run;
-    /// outputs are indexed by the launch-local block.
+    /// Each block accumulates the in-circle count and the disagreeing-pair count
+    /// of its threads into its own slot of the outputs, which the host must zero
+    /// before the launch. `block_offset` is the launch's first block in the whole
+    /// run; outputs are indexed by the launch-local block.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(domain = 1, block = (256, 1, 1))]
@@ -55,12 +55,9 @@ mod kernels {
         seed: u64,
         cells_per_side: u32,
         block_offset: u64,
-        mut block_hits: DisjointSlice<u32>,
-        mut block_disagreements: DisjointSlice<u32>,
+        block_hits: &[DeviceAtomicU32],
+        block_disagreements: &[DeviceAtomicU32],
     ) {
-        static mut WARP_HITS: SharedArray<u32, 8> = SharedArray::UNINIT;
-        static mut WARP_DISAGREEMENTS: SharedArray<u32, 8> = SharedArray::UNINIT;
-
         let tid = thread::threadIdx_x();
         let block = thread::blockIdx_x();
         let gid = (block_offset + block as u64) * thread::blockDim_x() as u64 + tid as u64;
@@ -71,33 +68,10 @@ mod kernels {
         let disagreements = warp_sum(stats.disagreements);
 
         if warp::lane_id() == 0 {
-            // SAFETY: one lane-0 writer per warp slot (tid / 32 < 8).
-            unsafe {
-                WARP_HITS[(tid / 32) as usize] = hits;
-                WARP_DISAGREEMENTS[(tid / 32) as usize] = disagreements;
-            }
-        }
-        thread::sync_threads();
-
-        if tid == 0 {
-            let mut total_hits = 0;
-            let mut total_disagreements = 0;
-            let mut w = 0;
-            while w < 8 {
-                // SAFETY: all slots were written before the barrier above.
-                unsafe {
-                    total_hits += WARP_HITS[w];
-                    total_disagreements += WARP_DISAGREEMENTS[w];
-                }
-                w += 1;
-            }
-            // SAFETY: only thread 0 of each block writes, at the block's own
-            // index, and the launch grid has at most `block_hits.len()` blocks
-            // (the host sizes both buffers for a full chunk).
-            unsafe {
-                *block_hits.get_unchecked_mut(block as usize) = total_hits;
-                *block_disagreements.get_unchecked_mut(block as usize) = total_disagreements;
-            }
+            // Eight warps share a block's slot, so the sum needs an atomic. The
+            // add is commutative, so the totals do not depend on warp order.
+            block_hits[block as usize].fetch_add(hits, AtomicOrdering::Relaxed);
+            block_disagreements[block as usize].fetch_add(disagreements, AtomicOrdering::Relaxed);
         }
     }
 }
@@ -106,9 +80,6 @@ mod kernels {
 struct Gpu {
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
-    // Sized for one full chunk, so a run never allocates per launch.
-    block_hits: DeviceBuffer<u32>,
-    block_disagreements: DeviceBuffer<u32>,
 }
 
 /// Totals of a whole run, plus the first blocks' counts for CPU verification.
@@ -124,18 +95,10 @@ impl Gpu {
     fn new() -> Result<Self> {
         let ctx = CudaContext::new(0).context("failed to initialise CUDA device 0")?;
         let stream = ctx.default_stream();
-        let len = MAX_CHUNK_BLOCKS.get() as usize;
-        let block_hits = DeviceBuffer::<u32>::zeroed(&stream, len)?;
-        let block_disagreements = DeviceBuffer::<u32>::zeroed(&stream, len)?;
         // SAFETY: this package owns the embedded device bundle produced for the
         // kernels module above.
         let module = unsafe { kernels::load(&ctx)? };
-        Ok(Self {
-            stream,
-            module,
-            block_hits,
-            block_disagreements,
-        })
+        Ok(Self { stream, module })
     }
 
     /// Runs every chunk of `cfg`. There is no mid-run cutoff: stopping early
@@ -147,8 +110,21 @@ impl Gpu {
             secs: 0.0,
             head: Vec::new(),
         };
+        // Sized for one full chunk, so a run never allocates per launch.
+        let len = MAX_CHUNK_BLOCKS.get() as usize;
+        let mut block_hits = DeviceBuffer::<u32>::zeroed(&self.stream, len)?;
+        let mut block_disagreements = DeviceBuffer::<u32>::zeroed(&self.stream, len)?;
         for chunk in cfg.chunks() {
             let blocks = chunk.blocks.get();
+            // Blocks add into their slot, so every launch must start from zero.
+            block_hits.zero_async(&self.stream)?;
+            block_disagreements.zero_async(&self.stream)?;
+            // The kernel needs atomic elements, but `DeviceAtomicU32` is not
+            // `DeviceCopy`, so the host can only zero and read the counters as
+            // `u32`. `cast_elem` consumes the buffer, so it is moved to the
+            // atomic view for the launch and back afterwards.
+            let hits_atomic = block_hits.cast_elem::<DeviceAtomicU32>();
+            let disagreements_atomic = block_disagreements.cast_elem::<DeviceAtomicU32>();
             let prepared =
                 self.module
                     .prepare_count_hits(LaunchConfig1D::new(blocks, BLOCK_THREADS, 0))?;
@@ -162,17 +138,19 @@ impl Gpu {
                 SEED,
                 cfg.grid().cells_per_side(),
                 chunk.first_block,
-                &mut self.block_hits,
-                &mut self.block_disagreements,
+                &hits_atomic,
+                &disagreements_atomic,
             )?;
             let end = self
                 .stream
                 .record_event(Some(CUevent_flags_enum_CU_EVENT_DEFAULT))?;
             run.secs += start.elapsed_ms(&end)? as f64 / 1e3;
 
+            block_hits = hits_atomic.cast_elem();
+            block_disagreements = disagreements_atomic.cast_elem();
             // The buffers hold a full chunk; only the launched blocks are written.
-            let hits = self.block_hits.to_host_vec(&self.stream)?;
-            let disagreements = self.block_disagreements.to_host_vec(&self.stream)?;
+            let hits = block_hits.to_host_vec(&self.stream)?;
+            let disagreements = block_disagreements.to_host_vec(&self.stream)?;
             let launched = blocks as usize;
             run.hits += hits[..launched].iter().map(|&h| h as u64).sum::<u64>();
             run.disagreements += disagreements[..launched]
