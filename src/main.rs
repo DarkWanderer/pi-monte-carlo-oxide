@@ -86,7 +86,8 @@ struct Gpu {
 struct GpuRun {
     hits: u64,
     disagreements: u64,
-    /// Sum of per-launch kernel times; host copies between launches are excluded.
+    /// Sum of per-launch kernel times; host copies and counter memsets between
+    /// launches are excluded.
     secs: f64,
     head: Vec<Stats>,
 }
@@ -103,7 +104,7 @@ impl Gpu {
 
     /// Runs every chunk of `cfg`. There is no mid-run cutoff: stopping early
     /// would leave part of the grid unsampled, which biases a stratified estimate.
-    fn run(&mut self, cfg: RunConfig) -> Result<GpuRun> {
+    fn run(&self, cfg: RunConfig) -> Result<GpuRun> {
         let mut run = GpuRun {
             hits: 0,
             disagreements: 0,
@@ -116,9 +117,12 @@ impl Gpu {
         let mut block_disagreements = DeviceBuffer::<u32>::zeroed(&self.stream, len)?;
         for chunk in cfg.chunks() {
             let blocks = chunk.blocks.get();
-            // Blocks add into their slot, so every launch must start from zero.
-            block_hits.zero_async(&self.stream)?;
-            block_disagreements.zero_async(&self.stream)?;
+            // Blocks add into their slot, so a launch must not start from the
+            // previous chunk's counts. The first chunk uses the zeroed allocation.
+            if chunk.first_block != 0 {
+                block_hits.zero_async(&self.stream)?;
+                block_disagreements.zero_async(&self.stream)?;
+            }
             // The kernel needs atomic elements, but `DeviceAtomicU32` is not
             // `DeviceCopy`, so the host can only zero and read the counters as
             // `u32`. `cast_elem` consumes the buffer, so it is moved to the
@@ -173,7 +177,7 @@ impl Gpu {
     }
 
     /// Measured throughput in samples/s.
-    fn calibrate(&mut self) -> Result<f64> {
+    fn calibrate(&self) -> Result<f64> {
         let cfg = RunConfig::for_samples(1 << CALIBRATION_LOG2_SAMPLES)?;
         let run = self.run(cfg)?;
         Ok(cfg.total_samples().get() as f64 / run.secs)
@@ -211,7 +215,7 @@ fn log2_samples(cfg: RunConfig) -> f64 {
 }
 
 fn run(budget: Budget) -> Result<()> {
-    let mut gpu = Gpu::new()?;
+    let gpu = Gpu::new()?;
     gpu.run(RunConfig::for_samples(1 << WARM_UP_LOG2_SAMPLES)?)?;
 
     let cfg = match budget {

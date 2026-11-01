@@ -78,9 +78,9 @@ build is rejected by device codegen with "atomic ordering must be a compile-time
 RTX 3090 Ti under WSL2, `cargo oxide run`:
 
 ```text
- INFO Calibration: 3.344e11 samples/s, so 12.0 s budget -> N = 2^41.79 (M = 1380582)
- INFO π ≈ 3.141592654  |error| = 8.612e-10  σ̂ = 8.907e-10  (plain MC σ at the same N: 8.411e-7, gain ×944)
- INFO GPU: N = 2^41.79 samples in 11.625 s (3.279e11 samples/s)
- INFO CPU: 1 thread, 2^26 samples (4.523e8 samples/s)  GPU speedup ×725
+ INFO Calibration: 2.866e11 samples/s, so 12.0 s budget -> N = 2^41.57 (M = 1278040)
+ INFO π ≈ 3.141592654  |error| = 6.103e-10  σ̂ = 9.986e-10  (plain MC σ at the same N: 9.086e-7, gain ×910)
+ INFO GPU: N = 2^41.57 samples in 10.743 s (3.041e11 samples/s)
+ INFO CPU: 1 thread, 2^26 samples (4.421e8 samples/s)  GPU speedup ×688
  INFO PASSED: GPU matches CPU on the first 16 blocks, estimate within 5σ̂
 ```

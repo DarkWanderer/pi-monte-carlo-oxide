@@ -19,7 +19,7 @@ pub const SAMPLES_PER_THREAD: u32 = 1024;
 pub const PAIRS_PER_THREAD: u32 = SAMPLES_PER_THREAD / 2;
 const PAIRS_PER_BLOCK: u64 = BLOCK_THREADS as u64 * PAIRS_PER_THREAD as u64;
 
-/// Blocks per kernel launch (2^36 samples, about 0.16 s on a 3090 Ti). WSL2 may
+/// Blocks per kernel launch (2^36 samples, about 0.22 s on a 3090 Ti). WSL2 may
 /// enforce the ~2 s Windows TDR watchdog, which one long kernel would hit.
 pub const MAX_CHUNK_BLOCKS: NonZeroU32 = nz32(1 << 18);
 
