@@ -12,3 +12,4 @@
 **/*.ptx
 **/*.ptx.identity
 **/*.target
+.oxide-artifacts/
