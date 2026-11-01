@@ -13,7 +13,7 @@ N^(-3/4) instead of the N^(-1/2) of plain hit-or-miss:
 | 2^32            | 2.5e-5  | 1.4e-7       | 14 ms            |
 | 2^36            | 6.3e-6  | 1.8e-8       | 0.22 s           |
 | 2^40            | 1.6e-6  | 2.3e-9       | 3.3 s            |
-| 2^41.8 (12 s)   | 8.4e-7  | 8.9e-10      | 11.6 s           |
+| 2^41.6 (12 s)   | 9.1e-7  | 1.0e-9       | 10.7 s           |
 
 The estimate stays random and unbiased, integer-only, and bit-exact between GPU and CPU.
 
